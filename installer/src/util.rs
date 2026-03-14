@@ -14,10 +14,17 @@ use crate::output::{print, println};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
+/// Default timeout for telnet commands. File transfers use a longer timeout.
+pub const TELNET_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout for the nc-based file receive command; large binaries over WiFi can take a while.
+const TELNET_FILE_RECEIVE_TIMEOUT: Duration = Duration::from_secs(120);
+
 pub async fn telnet_send_command_with_output(
     addr: SocketAddr,
     command: &str,
     wait_for_prompt: bool,
+    timeout_duration: Duration,
 ) -> Result<String> {
     if command.contains('\n') {
         bail!("multi-line commands are not allowed");
@@ -42,7 +49,7 @@ pub async fn telnet_send_command_with_output(
     writer.write_all(format!("echo RAYHUNTER_'TELNET'_COMMAND_START; {command}; echo RAYHUNTER_'TELNET'_COMMAND_DONE\r\n").as_bytes()).await?;
 
     let mut read_buf = Vec::new();
-    timeout(Duration::from_secs(10), async {
+    timeout(timeout_duration, async {
         loop {
             let Ok(byte) = reader.read_u8().await else {
                 break;
@@ -61,7 +68,7 @@ pub async fn telnet_send_command_with_output(
         }
     })
     .await
-    .context("command timed out after 10 seconds")?;
+    .with_context(|| format!("command timed out after {} seconds", timeout_duration.as_secs()))?;
     let string = String::from_utf8_lossy(&read_buf);
     let start = string.rfind("RAYHUNTER_TELNET_COMMAND_START");
     let end = string.rfind("RAYHUNTER_TELNET_COMMAND_DONE");
@@ -83,7 +90,13 @@ pub async fn telnet_send_command(
     wait_for_prompt: bool,
 ) -> Result<()> {
     let command = format!("{command}; echo command done, exit code $?");
-    let output = telnet_send_command_with_output(addr, &command, wait_for_prompt).await?;
+    let output = telnet_send_command_with_output(
+        addr,
+        &command,
+        wait_for_prompt,
+        TELNET_COMMAND_TIMEOUT,
+    )
+    .await?;
     if !output.contains(expected_output) {
         bail!("{expected_output:?} not found in: {output}");
     }
@@ -104,6 +117,7 @@ pub async fn telnet_send_file(
                 addr,
                 &format!("nc -l -p 8081 2>&1 >{filename}.tmp"),
                 wait_for_prompt,
+                TELNET_FILE_RECEIVE_TIMEOUT,
             )
             .await
         });
